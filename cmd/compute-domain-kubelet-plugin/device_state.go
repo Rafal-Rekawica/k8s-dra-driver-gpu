@@ -36,6 +36,9 @@ import (
 	"sigs.k8s.io/nvidia-dra-driver-gpu/pkg/featuregates"
 )
 
+type UpdateCheckpointFunc func(mutate func(*Checkpoint)) error
+type GetCheckpointFunc func(checkpointKey string, checkpoint checkpointmanager.Checkpoint) error
+
 type OpaqueDeviceConfig struct {
 	Requests []string
 	Config   runtime.Object
@@ -52,6 +55,7 @@ type DeviceState struct {
 	cdi                      *CDIHandler
 	computeDomainManager     *ComputeDomainManager
 	checkpointCleanupManager *CheckpointCleanupManager
+	podManager               *PodManager
 	allocatable              AllocatableDevices
 	config                   *Config
 	nvdevlib                 *deviceLib
@@ -103,15 +107,15 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		return nil, fmt.Errorf("error getting cliqueID: %w", err)
 	}
 
+	checkpointManager, err := checkpointmanager.NewCheckpointManager(config.DriverPluginPath())
+	if err != nil {
+		return nil, fmt.Errorf("unable to create checkpoint manager: %v", err)
+	}
+
 	computeDomainManager := NewComputeDomainManager(config, cliqueID)
 
 	if err := cdi.CreateStandardDeviceSpecFile(allocatable); err != nil {
 		return nil, fmt.Errorf("unable to create base CDI spec file: %v", err)
-	}
-
-	checkpointManager, err := checkpointmanager.NewCheckpointManager(config.DriverPluginPath())
-	if err != nil {
-		return nil, fmt.Errorf("unable to create checkpoint manager: %v", err)
 	}
 
 	state := &DeviceState{
@@ -122,6 +126,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		nvdevlib:             nvdevlib,
 		checkpointManager:    checkpointManager,
 	}
+	state.podManager = NewPodManager(config, state.updateCheckpoint, checkpointManager.GetCheckpoint, computeDomainManager.AssertComputeDomainNamespace, computeDomainManager.AddNodeLabel, computeDomainManager.RemoveNodeLabel, computeDomainManager.AssertComputeDomainReady)
 	state.checkpointCleanupManager = NewCheckpointCleanupManager(state, config.clientsets.Resource)
 
 	checkpoints, err := state.checkpointManager.ListCheckpoints()

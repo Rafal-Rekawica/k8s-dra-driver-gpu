@@ -46,13 +46,15 @@ type PodManager struct {
 	informer cache.SharedIndexInformer
 	lister   corev1listers.PodLister
 
+	getCheckpointFunc        GetCheckpointFunc
+	updateCheckpointFunc     UpdateCheckpointFunc
 	assertNamespace          AssertNameSpaceFunc
 	addNodeLabel             AddNodeLabelFunc
 	removeNodeLabel          RemoveNodeLabelFunc
 	assertComputeDomainReady AssertComputeDomainReadyFunc
 }
 
-func NewPodManager(config *Config, assertNamespace AssertNameSpaceFunc, addNodeLabel AddNodeLabelFunc, removeNodeLabel RemoveNodeLabelFunc, assertComputeDomainReady AssertComputeDomainReadyFunc) *PodManager {
+func NewPodManager(config *Config, updateCheckpointFunc UpdateCheckpointFunc, getCheckpointFunc GetCheckpointFunc, assertNamespace AssertNameSpaceFunc, addNodeLabel AddNodeLabelFunc, removeNodeLabel RemoveNodeLabelFunc, assertComputeDomainReady AssertComputeDomainReadyFunc) *PodManager {
 	selector := fmt.Sprintf("status.nominatedNodeName=%s", config.flags.nodeName)
 
 	factory := informers.NewSharedInformerFactoryWithOptions(
@@ -68,6 +70,8 @@ func NewPodManager(config *Config, assertNamespace AssertNameSpaceFunc, addNodeL
 
 	return &PodManager{
 		config:                   config,
+		getCheckpointFunc:        getCheckpointFunc,
+		updateCheckpointFunc:     updateCheckpointFunc,
 		factory:                  factory,
 		informer:                 informer,
 		lister:                   lister,
@@ -180,6 +184,21 @@ func (m *PodManager) onAddOrUpdate(ctx context.Context, obj any) error {
 		return nil
 	}
 
+	err = m.updateCheckpointClaim(string(targetRC.UID), targetRC)
+	if err != nil {
+		return fmt.Errorf("error updating checkpoint claim: %w", err)
+	}
+
+	if len(pod.Status.Conditions) > 0 {
+		if pod.Status.Conditions[0].Reason == "SchedulerError" {
+			if err := m.removeNodeLabel(ctx, domainID); err != nil {
+				return fmt.Errorf("error removing Node label for ComputeDomain: %w", err)
+			}
+			klog.V(2).Infof("Binding timeout detected. Removing Node label for ComputeDomain with domainID %s", domainID)
+			return nil
+		}
+	}
+
 	// Add node label to start IMEX DaemonSet pod
 	if err := m.addNodeLabel(ctx, domainID); err != nil {
 		return fmt.Errorf("error adding Node label for ComputeDomain: %w", err)
@@ -232,20 +251,38 @@ func (m *PodManager) GetResourceClaims(ctx context.Context, pod *corev1.Pod) ([]
 // - The device has BindingConditions
 // - The device is not set BindingConditions or BindingFailureConditions
 func (m *PodManager) getComputeDomainChannelRequestConfig(rc *resourcev1.ResourceClaim) (*nvapi.ComputeDomainChannelConfig, error) {
+	rcStatus := rc.Status
 	if rc.Status.Allocation == nil || len(rc.Status.ReservedFor) == 0 {
-		return nil, fmt.Errorf("error ResourceClaim has no status")
+		checkpointStatus, err := m.getCheckpointedClaimStatus(string(rc.UID))
+		if err != nil {
+			return nil, fmt.Errorf("error getting checkpoint status for ResourceClaim %s/%s: %w", rc.Namespace, rc.Name, err)
+		}
+		if checkpointStatus == nil || checkpointStatus.Allocation == nil || len(checkpointStatus.ReservedFor) == 0 {
+			return nil, fmt.Errorf("error ResourceClaim has no status")
+		}
+
+		rcStatus = *checkpointStatus
+		klog.V(4).Infof("Using checkpoint status for ResourceClaim %s/%s (%s)", rc.Namespace, rc.Name, rc.UID)
+	}
+
+	checkpointStatus, err := m.getCheckpointedClaimStatus(string(rc.UID))
+	if err != nil {
+		return nil, fmt.Errorf("error getting checkpoint status for ResourceClaim %s/%s: %w", rc.Namespace, rc.Name, err)
+	}
+	if checkpointStatus == nil {
+		klog.V(4).Infof("ResourceClaim checkpoint has no status")
 	}
 
 	configs, err := GetOpaqueDeviceConfigs(
 		nvapi.StrictDecoder,
 		DriverName,
-		rc.Status.Allocation.Devices.Config,
+		rcStatus.Allocation.Devices.Config,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, result := range rc.Status.Allocation.Devices.Results {
+	for _, result := range rcStatus.Allocation.Devices.Results {
 		// Check the driver
 		if result.Driver != DriverName {
 			continue
@@ -274,6 +311,44 @@ func (m *PodManager) getComputeDomainChannelRequestConfig(rc *resourcev1.Resourc
 	}
 
 	return nil, nil
+}
+
+func (m *PodManager) getCheckpointedClaimStatus(claimUID string) (*resourcev1.ResourceClaimStatus, error) {
+	if claimUID == "" {
+		return nil, nil
+	}
+
+	checkpoint := &Checkpoint{}
+	if err := m.getCheckpointFunc(DriverPluginCheckpointFileBasename, checkpoint); err != nil {
+		return nil, fmt.Errorf("unable to read checkpoint: %w", err)
+	}
+
+	preparedClaim, exists := checkpoint.ToLatestVersion().V2.PreparedClaims[claimUID]
+	if !exists {
+		klog.V(4).Infof("PreparedClaim with UID %s not found in checkpoint", claimUID)
+		return nil, nil
+	}
+
+	return &preparedClaim.Status, nil
+}
+
+func (m *PodManager) updateCheckpointClaim(claimUID string, claim *resourcev1.ResourceClaim) error {
+	if claimUID == "" {
+		return nil
+	}
+	err := m.updateCheckpointFunc(func(checkpoint *Checkpoint) {
+		checkpoint.V2.PreparedClaims[claimUID] = PreparedClaim{
+			CheckpointState: ClaimCheckpointStatePrepareStarted,
+			Status:          claim.Status,
+			Name:            claim.Name,
+			Namespace:       claim.Namespace,
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("unable to update checkpoint: %w", err)
+	}
+	klog.V(6).Infof("checkpoint updated for claim %v", claimUID)
+	return nil
 }
 
 func (m *PodManager) SetBindingConditions(ctx context.Context, rcName, rcNamespace string, conditionType string) error {

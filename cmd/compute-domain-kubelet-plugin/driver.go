@@ -32,6 +32,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 
+	"sigs.k8s.io/nvidia-dra-driver-gpu/pkg/featuregates"
 	"sigs.k8s.io/nvidia-dra-driver-gpu/pkg/flock"
 	"sigs.k8s.io/nvidia-dra-driver-gpu/pkg/workqueue"
 )
@@ -122,6 +123,12 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		return nil, fmt.Errorf("error starting ComputeDomain manager: %w", err)
 	}
 
+	if featuregates.Enabled(featuregates.ComputeDomainBindingConditions) {
+		if err := state.podManager.Start(ctx); err != nil {
+			return nil, fmt.Errorf("error starting Pod manager: %w", err)
+		}
+	}
+
 	// Pass `nodeUnprepareResource` function in the cleanup manager.
 	if err := state.checkpointCleanupManager.Start(ctx, driver.nodeUnprepareResource); err != nil {
 		return nil, fmt.Errorf("error starting CheckpointCleanupManager: %w", err)
@@ -147,6 +154,12 @@ func (d *driver) Shutdown() error {
 
 	if err := d.state.computeDomainManager.Stop(); err != nil {
 		return fmt.Errorf("error stopping ComputeDomainManager: %w", err)
+	}
+
+	if featuregates.Enabled(featuregates.ComputeDomainBindingConditions) {
+		if err := d.state.podManager.Stop(); err != nil {
+			return fmt.Errorf("error stopping Pod manager: %w", err)
+		}
 	}
 
 	if err := d.state.checkpointCleanupManager.Stop(); err != nil {
